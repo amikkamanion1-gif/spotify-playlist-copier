@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spotify Playlist Copier</title>
+<style>
+:root{color-scheme:dark}*{box-sizing:border-box}
+body{margin:0;padding:22px;background:#101510;color:#f2f6f2;font:16px/1.5 system-ui,sans-serif}
+main{max-width:760px;margin:auto;background:#1b241d;border:1px solid #354638;border-radius:18px;padding:25px}
+h1{margin-top:0;font-size:1.65rem}label{display:block;margin:17px 0 6px;font-weight:650}
+input,select{width:100%;padding:12px;border-radius:9px;border:1px solid #58675b;background:#101710;color:white;font:inherit}
+button{border:0;border-radius:999px;background:#1ed760;color:#07150b;padding:12px 18px;font-weight:750;font-size:1rem;cursor:pointer;margin:12px 8px 0 0}
+button:disabled{opacity:.45;cursor:not-allowed}.secondary{background:#39483d;color:#fff}
+.small{font-size:.9rem;color:#c4cec5}.status{white-space:pre-wrap;margin-top:18px;padding:13px;border-radius:10px;background:#101710}
+a{color:#8be8a7}.hidden{display:none}.step{margin:16px 0;padding:13px;background:#253127;border-radius:10px}
+</style>
+</head>
+<body>
+<main>
+<h1>Spotify Playlist Copier</h1>
+<p>Make a new Spotify playlist containing only the songs from a chosen point in another playlist to its end.</p>
+
+<div class="step">
+<strong>Step 1 — Connect your Spotify app</strong>
+<p class="small">You need a Spotify Developer app. Enter its Client ID and the exact Redirect URI registered in that app. This page never asks for your Spotify password.</p>
+<label for="clientId">Spotify Client ID</label>
+<input id="clientId" placeholder="Your app's Client ID" autocomplete="off">
+<label for="redirectUri">Redirect URI</label>
+<input id="redirectUri" placeholder="e.g. http://127.0.0.1:8000/spotify_playlist_helper.html" autocomplete="url">
+<p class="small">The page must be opened from the same registered web address (not directly as a file). For a local copy, serve its folder on localhost and register that exact URL in your Spotify app settings.</p>
+<button id="connect">Connect to Spotify</button>
+<button id="disconnect" class="secondary">Disconnect</button>
+<div id="account" class="small">Not connected.</div>
+</div>
+
+<div class="step">
+<strong>Step 2 — Choose the source playlist</strong>
+<label for="playlistUrl">Spotify playlist URL</label>
+<input id="playlistUrl" placeholder="https://open.spotify.com/playlist/..." autocomplete="url">
+<button id="load" class="secondary" disabled>Load playlist tracks</button>
+<div id="trackInfo" class="small"></div>
+<label for="startTrack">Start from track</label>
+<select id="startTrack" disabled><option value="0">Load a playlist first</option></select>
+</div>
+
+<div class="step">
+<strong>Step 3 — Create your new playlist</strong>
+<label for="newName">New playlist name</label>
+<input id="newName" value="Playlist selection">
+<label for="privacy">Visibility</label>
+<select id="privacy"><option value="false">Private (only you can see it)</option><option value="true">Public</option></select>
+<button id="create" disabled>Create playlist in my Spotify</button>
+</div>
+
+<div id="status" class="status" role="status" aria-live="polite">Ready. Connect your Spotify account to begin.</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let accessToken=null, expiresAt=0, loadedTracks=[], currentUser=null;
+const scopes='playlist-modify-private playlist-modify-public';
+
+function say(message){$('status').textContent=message}
+function base64url(bytes){
+  let binary=''; bytes.forEach(b=>binary+=String.fromCharCode(b));
+  return btoa(binary).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function randomString(n=64){
+  const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
+  const bytes=crypto.getRandomValues(new Uint8Array(n));
+  return Array.from(bytes,b=>chars[b%chars.length]).join('');
+}
+async function sha256(text){
+  return new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)));
+}
+function playlistId(value){
+  const s=value.trim();
+  const m=s.match(/(?:open\.spotify\.com\/playlist\/|spotify:playlist:)([A-Za-z0-9]+)/);
+  return m?m[1]:null;
+}
+async function api(url, options={}){
+  const response=await fetch(url,{...options,headers:{
+    Authorization:'Bearer '+accessToken,
+    ...(options.body?{'Content-Type':'application/json'}:{}),
+    ...(options.headers||{})
+  }});
+  const data=await response.json().catch(()=>({}));
+  if(!response.ok) throw new Error(data.error?.message||data.error_description||`Spotify API error (${response.status})`);
+  return data;
+}
+function updateButtons(){
+  $('load').disabled=!accessToken;
+  $('create').disabled=!accessToken||loadedTracks.length===0;
+}
+async function finishLogin(){
+  const params=new URLSearchParams(location.search);
+  const code=params.get('code');
+  if(!code)return;
+  const verifier=sessionStorage.getItem('spotify_pkce_verifier');
+  const redirect=sessionStorage.getItem('spotify_redirect_uri');
+  const clientId=sessionStorage.getItem('spotify_client_id');
+  if(!verifier||!redirect||!clientId){say('Login details were not found. Please connect again.');return;}
+  try{
+    say('Finishing Spotify sign-in…');
+    const body=new URLSearchParams({
+      client_id:clientId,grant_type:'authorization_code',code,redirect_uri:redirect,code_verifier:verifier
+    });
+    const response=await fetch('https://accounts.spotify.com/api/token',{
+      method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body
+    });
+    const token=await response.json();
+    if(!response.ok)throw new Error(token.error_description||token.error||'Could not get access token');
+    accessToken=token.access_token;expiresAt=Date.now()+token.expires_in*1000;
+    history.replaceState({},document.title,location.pathname);
+    sessionStorage.removeItem('spotify_pkce_verifier');
+    currentUser=await api('https://api.spotify.com/v1/me');
+    $('account').textContent='Connected as '+(currentUser.display_name||currentUser.id);
+    say('Connected. Paste a Spotify playlist link and load its tracks.');
+    updateButtons();
+  }catch(e){say('Sign-in failed: '+e.message)}
+}
+$('connect').onclick=async()=>{
+  try{
+    const clientId=$('clientId').value.trim(),redirect=$('redirectUri').value.trim();
+    if(!clientId||!redirect){say('Enter your Client ID and Redirect URI first.');return;}
+    const u=new URL(redirect);
+    if(!['http:','https:'].includes(u.protocol)){say('Use an http or https Redirect URI registered in your Spotify app.');return;}
+    const verifier=randomString(64),challenge=base64url(await sha256(verifier));
+    sessionStorage.setItem('spotify_pkce_verifier',verifier);
+    sessionStorage.setItem('spotify_redirect_uri',redirect);
+    sessionStorage.setItem('spotify_client_id',clientId);
+    const params=new URLSearchParams({
+      client_id:clientId,response_type:'code',redirect_uri:redirect,
+      code_challenge_method:'S256',code_challenge:challenge,scope:scopes
+    });
+    location.href='https://accounts.spotify.com/authorize?'+params.toString();
+  }catch(e){say('Could not start sign-in: '+e.message)}
+};
+$('disconnect').onclick=()=>{
+  accessToken=null;loadedTracks=[];currentUser=null;
+  $('account').textContent='Not connected.';$('trackInfo').textContent='';
+  $('startTrack').innerHTML='<option value="0">Load a playlist first</option>';
+  updateButtons();say('Disconnected. Any temporary access token has been cleared.');
+};
+$('load').onclick=async()=>{
+  try{
+    const id=playlistId($('playlistUrl').value);
+    if(!id){say('That does not look like a Spotify playlist URL.');return;}
+    say('Loading playlist tracks…');
+    let url=`https://api.spotify.com/v1/playlists/${id}/items?limit=50`;
+    const all=[];
+    while(url){
+      const page=await api(url);
+      for(const entry of (page.items||[])){
+        const item=entry.item;
+        if(item&&item.type==='track'&&item.uri&&!item.is_local)all.push(item);
+      }
+      url=page.next;
+    }
+    loadedTracks=all;
+    const select=$('startTrack');select.replaceChildren();
+    all.forEach((track,index)=>{
+      const option=document.createElement('option');
+      option.value=String(index);
+      option.textContent=`${index+1}. ${track.name} — ${(track.artists||[]).map(a=>a.name).join(', ')}`;
+      select.append(option);
+    });
+    $('trackInfo').textContent=`Loaded ${all.length} playable tracks.`;
+    if(!all.length)say('No playable tracks were returned. Spotify may restrict reading this playlist, or it may contain only unavailable/local items.');
+    else say(`Loaded ${all.length} tracks. Choose where the new playlist should start.`);
+    updateButtons();
+  }catch(e){say('Could not load playlist: '+e.message+'\nSome playlists may not be readable through Spotify API access, especially playlists you do not own or collaborate on.')}
+};
+$('create').onclick=async()=>{
+  try{
+    const start=Number($('startTrack').value)||0;
+    const chosen=loadedTracks.slice(start);
+    if(!chosen.length){say('There are no tracks from that starting point.');return;}
+    const name=$('newName').value.trim();
+    if(!name){say('Enter a name for the new playlist.');return;}
+    $('create').disabled=true;
+    say(`Creating a ${$('privacy').value==='true'?'public':'private'} playlist…`);
+    const playlist=await api('https://api.spotify.com/v1/me/playlists',{
+      method:'POST',body:JSON.stringify({
+        name,public:$('privacy').value==='true',collaborative:false,
+        description:`Created from a selected point in another playlist. ${chosen.length} tracks.`
+      })
+    });
+    const uris=chosen.map(t=>t.uri);
+    for(let i=0;i<uris.length;i+=100){
+      say(`Adding tracks ${i+1}–${Math.min(i+100,uris.length)} of ${uris.length}…`);
+      await api(`https://api.spotify.com/v1/playlists/${playlist.id}/items`,{
+        method:'POST',body:JSON.stringify({uris:uris.slice(i,i+100)})
+      });
+    }
+    const link=playlist.external_urls?.spotify||`https://open.spotify.com/playlist/${playlist.id}`;
+    say(`Finished! Added ${uris.length} tracks in order.\n\nYour new playlist:\n${link}`);
+    const a=document.createElement('a');a.href=link;a.target='_blank';a.rel='noopener noreferrer';a.textContent='Open your new Spotify playlist';
+    $('status').append(document.createElement('br'),a);
+  }catch(e){say('Could not create the playlist: '+e.message)}
+  finally{updateButtons()}
+};
+finishLogin();
+</script>
+</body>
+</html>
